@@ -1,5 +1,36 @@
+local ENDPOINT = "https://titanium-staff.test5555543.workers.dev"
+local LICENSING_ENDPOINT = "https://715bbbf9.titanium-pages-proxy.pages.dev"
 
-local ENDPOINT = "https://715bbbf9.titanium-pages-proxy.pages.dev/api/payload"
+-- Get HWID (Hardware ID) - uses Roblox's analytics service for stable ID
+local function getHWID()
+    local success, hwid = pcall(function()
+        local AnalyticsService = game:GetService("RbxAnalyticsService")
+        if AnalyticsService then
+            return AnalyticsService:GetClientId()
+        end
+        return nil
+    end)
+    
+    if success and hwid then
+        return tostring(hwid)
+    end
+    
+    -- Fallback: Use LocalPlayer UserId + PlaceId combo
+    local Players = game:GetService("Players")
+    if Players and Players.LocalPlayer then
+        return tostring(Players.LocalPlayer.UserId) .. "_" .. tostring(game.PlaceId)
+    end
+    
+    return "unknown"
+end
+
+-- Get client info for HWID/IP tracking
+local function getClientInfo()
+    return {
+        hwid = getHWID(),
+        ip = nil -- IP is captured server-side from request headers
+    }
+end
 
 local function httpGet(url)
     local host = tostring(url):match("^https?://([^/]+)") or ""
@@ -57,9 +88,6 @@ local function httpGet(url)
         if ok and type(res) == "string" then
             return res, "game:HttpGetAsync"
         end
-        if not ok then
-            return nil, "game_httpgetasync_error:" .. tostring(res)
-        end
     end
 
     if game and game.HttpGet then
@@ -68,9 +96,6 @@ local function httpGet(url)
         end)
         if ok and type(res) == "string" then
             return res, "game:HttpGet"
-        end
-        if not ok then
-            return nil, "game_httpget_error:" .. tostring(res)
         end
     end
 
@@ -86,6 +111,41 @@ local function httpGet(url)
     return nil, (code or "unknown")
 end
 
+local function httpPost(url, bodyTable)
+    local body = game:GetService("HttpService"):JSONEncode(bodyTable)
+    
+    local success, result = pcall(function()
+        if syn and syn.request then
+            return syn.request({
+                Url = url,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json",
+                    ["User-Agent"] = "Mozilla/5.0"
+                },
+                Body = body
+            })
+        elseif request then
+            return request({
+                Url = url,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json",
+                    ["User-Agent"] = "Mozilla/5.0"
+                },
+                Body = body
+            })
+        end
+        return nil
+    end)
+    
+    if success and result then
+        return result.Body or result.body, result.StatusCode or 200
+    end
+    
+    return nil, "post_failed"
+end
+
 local function urlEncode(s)
     s = tostring(s)
     s = s:gsub("\n", "\r\n")
@@ -95,315 +155,347 @@ local function urlEncode(s)
     return s:gsub(" ", "+")
 end
 
-local function getKey()
+print("[TITANIUM] Loader initialized")
+print("[TITANIUM] HWID: " .. getHWID():sub(1, 20) .. "...")
+
+-- Key Entry and Validation (with HWID/IP locking)
+local function validateKey()
     local env = (getgenv and getgenv()) or _G
-
-    if env and type(env.PROJECT_LICENSE_KEY) == "string" and #env.PROJECT_LICENSE_KEY >= 8 then
-        return env.PROJECT_LICENSE_KEY
-    end
-
-    if env and type(env.getLicenseKey) == "function" then
-        local ok, k = pcall(env.getLicenseKey)
-        if ok and type(k) == "string" and #k >= 8 then
-            return k
-        end
-    end
-
-    return nil
-end
-
-local function promptForKey()
-    local env = (getgenv and getgenv()) or _G
-
+    
     local Players = game:GetService("Players")
     local CoreGui = game:GetService("CoreGui")
     local TweenService = game:GetService("TweenService")
     local RunService = game:GetService("RunService")
-    local UserInputService = game:GetService("UserInputService")
 
     local parent = CoreGui
     pcall(function()
-        if gethui then
-            parent = gethui()
-        elseif get_hidden_ui then
-            parent = get_hidden_ui()
-        end
+        if gethui then parent = gethui()
+        elseif get_hidden_ui then parent = get_hidden_ui() end
     end)
 
     local gui = Instance.new("ScreenGui")
-    gui.Name = "ProjectKeyPrompt"
+    gui.Name = "TitaniumKeyPrompt"
     gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true
     gui.DisplayOrder = 1000000
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.Enabled = true
 
     pcall(function()
-        if syn and syn.protect_gui then
-            syn.protect_gui(gui)
-        elseif protectgui then
-            protectgui(gui)
-        end
+        if syn and syn.protect_gui then syn.protect_gui(gui)
+        elseif protectgui then protectgui(gui) end
     end)
 
     gui.Parent = parent
-    if not gui.Parent then
-        gui.Parent = CoreGui
-    end
-
-    gui.AncestryChanged:Connect(function()
-        if not gui.Parent then
-            pcall(function() gui.Parent = parent end)
-            if not gui.Parent then
-                gui.Parent = CoreGui
-            end
-        end
-    end)
-
-    local watchdogAlive = true
-    local function enforceOnTop()
-        if not watchdogAlive then return end
-        if gui and gui.Parent == nil then
-            pcall(function() gui.Parent = parent end)
-            if not gui.Parent then
-                gui.Parent = CoreGui
-            end
-        end
-        if gui then
-            gui.Enabled = true
-            gui.DisplayOrder = 1000000
-        end
-    end
-
-    local watchdogConn
-    watchdogConn = RunService.RenderStepped:Connect(function()
-        if not watchdogAlive then
-            if watchdogConn then watchdogConn:Disconnect() end
-            return
-        end
-        enforceOnTop()
-    end)
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 420, 0, 220)
-    frame.Position = UDim2.new(0.5, -210, 0.5, -110)
+    frame.Size = UDim2.new(0, 440, 0, 320)
+    frame.Position = UDim2.new(0.5, -220, 0.5, -160)
     frame.BackgroundColor3 = Color3.fromRGB(16, 17, 22)
     frame.BorderSizePixel = 0
     frame.ZIndex = 100
     frame.Parent = gui
 
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
+    corner.CornerRadius = UDim.new(0, 16)
     corner.Parent = frame
 
     local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(40, 40, 45)
+    stroke.Color = Color3.fromRGB(40, 40, 50)
     stroke.Thickness = 2
     stroke.Parent = frame
 
-    local bgGrad = Instance.new("UIGradient")
-    bgGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(18, 20, 28)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(12, 13, 18))
-    })
-    bgGrad.Rotation = 90
-    bgGrad.Parent = frame
-
-    local pad = Instance.new("UIPadding")
-    pad.PaddingTop = UDim.new(0, 16)
-    pad.PaddingBottom = UDim.new(0, 16)
-    pad.PaddingLeft = UDim.new(0, 16)
-    pad.PaddingRight = UDim.new(0, 16)
-    pad.Parent = frame
+    -- Title
+    local titleIcon = Instance.new("TextLabel")
+    titleIcon.Text = "*"
+    titleIcon.Size = UDim2.new(0, 40, 0, 40)
+    titleIcon.Position = UDim2.new(0, 30, 0, 25)
+    titleIcon.BackgroundTransparency = 1
+    titleIcon.TextColor3 = Color3.fromRGB(139, 92, 246)
+    titleIcon.Font = Enum.Font.GothamBold
+    titleIcon.TextSize = 32
+    titleIcon.Parent = frame
 
     local title = Instance.new("TextLabel")
+    title.Text = "TITANIUM"
+    title.Size = UDim2.new(1, -80, 0, 30)
+    title.Position = UDim2.new(0, 70, 0, 25)
     title.BackgroundTransparency = 1
-    title.Size = UDim2.new(1, 0, 0, 26)
-    title.Position = UDim2.new(0, 0, 0, 0)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 16
     title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 24
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Text = "Titanium Login"
     title.Parent = frame
 
-    local sub = Instance.new("TextLabel")
-    sub.BackgroundTransparency = 1
-    sub.Size = UDim2.new(1, 0, 0, 20)
-    sub.Position = UDim2.new(0, 0, 0, 28)
-    sub.Font = Enum.Font.Gotham
-    sub.TextSize = 13
-    sub.TextColor3 = Color3.fromRGB(170, 175, 190)
-    sub.TextXAlignment = Enum.TextXAlignment.Left
-    sub.Text = "Enter your license key to continue"
-    sub.Parent = frame
+    local subtitle = Instance.new("TextLabel")
+    subtitle.Text = "Enter license key (HWID/IP locked to first device)"
+    subtitle.Size = UDim2.new(1, -60, 0, 20)
+    subtitle.Position = UDim2.new(0, 30, 0, 65)
+    subtitle.BackgroundTransparency = 1
+    subtitle.TextColor3 = Color3.fromRGB(140, 145, 160)
+    subtitle.Font = Enum.Font.Gotham
+    subtitle.TextSize = 12
+    subtitle.TextXAlignment = Enum.TextXAlignment.Left
+    subtitle.Parent = frame
 
-    local box = Instance.new("TextBox")
-    box.Size = UDim2.new(1, 0, 0, 44)
-    box.Position = UDim2.new(0, 0, 0, 72)
-    box.BackgroundColor3 = Color3.fromRGB(22, 24, 33)
-    box.BorderSizePixel = 0
-    box.Font = Enum.Font.Gotham
-    box.TextSize = 14
-    box.TextColor3 = Color3.fromRGB(255, 255, 255)
-    box.PlaceholderColor3 = Color3.fromRGB(120, 125, 140)
-    box.PlaceholderText = "Paste license key here"
-    box.ClearTextOnFocus = false
-    box.ZIndex = 101
-    box.Parent = frame
+    -- Key input
+    local inputContainer = Instance.new("Frame")
+    inputContainer.Size = UDim2.new(1, -60, 0, 56)
+    inputContainer.Position = UDim2.new(0, 30, 0, 100)
+    inputContainer.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+    inputContainer.BorderSizePixel = 0
+    inputContainer.ZIndex = 101
+    inputContainer.Parent = frame
 
-    local boxCorner = Instance.new("UICorner")
-    boxCorner.CornerRadius = UDim.new(0, 6)
-    boxCorner.Parent = box
+    local inputCorner = Instance.new("UICorner")
+    inputCorner.CornerRadius = UDim.new(0, 12)
+    inputCorner.Parent = inputContainer
 
-    local boxStroke = Instance.new("UIStroke")
-    boxStroke.Color = Color3.fromRGB(55, 60, 75)
-    boxStroke.Thickness = 1
-    boxStroke.Parent = box
+    local inputStroke = Instance.new("UIStroke")
+    inputStroke.Color = Color3.fromRGB(55, 60, 75)
+    inputStroke.Thickness = 1.5
+    inputStroke.Parent = inputContainer
 
-    local hint = Instance.new("TextLabel")
-    hint.BackgroundTransparency = 1
-    hint.Size = UDim2.new(1, 0, 0, 18)
-    hint.Position = UDim2.new(0, 0, 0, 120)
-    hint.Font = Enum.Font.Gotham
-    hint.TextSize = 12
-    hint.TextColor3 = Color3.fromRGB(170, 175, 190)
-    hint.TextXAlignment = Enum.TextXAlignment.Left
-    hint.Text = "Have fun"
-    hint.ZIndex = 101
-    hint.Parent = frame
+    local keyIcon = Instance.new("TextLabel")
+    keyIcon.Text = "Key:"
+    keyIcon.Size = UDim2.new(0, 50, 1, 0)
+    keyIcon.Position = UDim2.new(0, 16, 0, 0)
+    keyIcon.BackgroundTransparency = 1
+    keyIcon.TextColor3 = Color3.fromRGB(139, 92, 246)
+    keyIcon.Font = Enum.Font.GothamBold
+    keyIcon.TextSize = 12
+    keyIcon.ZIndex = 102
+    keyIcon.Parent = inputContainer
 
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 0, 40)
-    btn.Position = UDim2.new(0, 0, 0, 146)
-    btn.BackgroundColor3 = Color3.fromRGB(85, 160, 255)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 14
-    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
-    btn.Text = "Continue"
-    btn.AutoButtonColor = true
-    btn.ZIndex = 101
-    btn.Parent = frame
+    local keyBox = Instance.new("TextBox")
+    keyBox.PlaceholderText = "TIT-XXX-XXXX-XXXX"
+    keyBox.PlaceholderColor3 = Color3.fromRGB(80, 85, 100)
+    keyBox.Text = ""
+    keyBox.Size = UDim2.new(1, -70, 1, 0)
+    keyBox.Position = UDim2.new(0, 60, 0, 0)
+    keyBox.BackgroundTransparency = 1
+    keyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    keyBox.Font = Enum.Font.GothamMedium
+    keyBox.TextSize = 14
+    keyBox.TextXAlignment = Enum.TextXAlignment.Left
+    keyBox.ClearTextOnFocus = false
+    keyBox.ZIndex = 102
+    keyBox.Parent = inputContainer
+
+    -- Status
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Text = ""
+    statusLabel.Size = UDim2.new(1, -60, 0, 40)
+    statusLabel.Position = UDim2.new(0, 30, 0, 165)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextSize = 11
+    statusLabel.TextWrapped = true
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.ZIndex = 101
+    statusLabel.Parent = frame
+
+    -- Submit button
+    local submitBtn = Instance.new("TextButton")
+    submitBtn.Text = "Continue"
+    submitBtn.Size = UDim2.new(1, -60, 0, 50)
+    submitBtn.Position = UDim2.new(0, 30, 0, 220)
+    submitBtn.BackgroundColor3 = Color3.fromRGB(139, 92, 246)
+    submitBtn.BorderSizePixel = 0
+    submitBtn.Font = Enum.Font.GothamBold
+    submitBtn.TextSize = 14
+    submitBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    submitBtn.AutoButtonColor = false
+    submitBtn.ZIndex = 101
+    submitBtn.Parent = frame
 
     local btnCorner = Instance.new("UICorner")
-    btnCorner.CornerRadius = UDim.new(0, 6)
-    btnCorner.Parent = btn
+    btnCorner.CornerRadius = UDim.new(0, 12)
+    btnCorner.Parent = submitBtn
 
-    local btnGrad = Instance.new("UIGradient")
-    btnGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(120, 190, 255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(60, 130, 255))
-    })
-    btnGrad.Rotation = 0
-    btnGrad.Parent = btn
+    -- Footer
+    local footer = Instance.new("TextLabel")
+    footer.Text = "HWID: " .. getHWID():sub(1, 16) .. "... | Key locked to first device"
+    footer.Size = UDim2.new(1, -60, 0, 14)
+    footer.Position = UDim2.new(0, 30, 1, -30)
+    footer.BackgroundTransparency = 1
+    footer.TextColor3 = Color3.fromRGB(80, 85, 100)
+    footer.Font = Enum.Font.Gotham
+    footer.TextSize = 9
+    footer.ZIndex = 101
+    footer.Parent = frame
 
-    local status = Instance.new("TextLabel")
-    status.BackgroundTransparency = 1
-    status.Size = UDim2.new(1, 0, 0, 18)
-    status.Position = UDim2.new(0, 0, 0, 192)
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 12
-    status.TextColor3 = Color3.fromRGB(255, 120, 120)
-    status.TextXAlignment = Enum.TextXAlignment.Left
-    status.Text = ""
-    status.ZIndex = 101
-    status.Parent = frame
+    -- Focus animations
+    keyBox.Focused:Connect(function()
+        TweenService:Create(inputStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(139, 92, 246)}):Play()
+    end)
+    keyBox.FocusLost:Connect(function()
+        TweenService:Create(inputStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(55, 60, 75)}):Play()
+    end)
 
+    -- Done event
     local done = Instance.new("BindableEvent")
 
     local function submit()
-        local k = tostring(box.Text or "")
-        k = k:gsub("^%s+", ""):gsub("%s+$", "")
-        if #k >= 8 then
-            btn.Text = "Loading..."
-            status.Text = ""
-            env.PROJECT_LICENSE_KEY = k
-            done:Fire(k)
-            watchdogAlive = false
-            if watchdogConn then
-                watchdogConn:Disconnect()
-                watchdogConn = nil
+        local k = tostring(keyBox.Text):gsub("^%s+", ""):gsub("%s+$", "")
+        
+        if #k < 8 then
+            statusLabel.Text = "Please enter a valid key"
+            return
+        end
+
+        submitBtn.Text = "Validating..."
+        submitBtn.Active = false
+        
+        local clientInfo = getClientInfo()
+        
+        -- Validate with server
+        local validateBody = {
+            key = k,
+            hwid = clientInfo.hwid
+        }
+        
+        local validateRes = httpPost(ENDPOINT .. "/api/keys/validate", validateBody)
+        
+        if validateRes then
+            local success, result = pcall(function()
+                return game:GetService("HttpService"):JSONDecode(validateRes)
+            end)
+            
+            if success and result then
+                if result.valid then
+                    if result.key and result.key.hwidSet then
+                        -- Already activated
+                        submitBtn.Text = "Key valid!"
+                        env.PROJECT_LICENSE_KEY = k
+                        env._TITANIUM_HWID = clientInfo.hwid
+                        done:Fire(k, false)
+                        gui.Enabled = false
+                        gui:ClearAllChildren()
+                    else
+                        -- First activation
+                        submitBtn.Text = "Activating..."
+                        
+                        local activateBody = {
+                            key = k,
+                            hwid = clientInfo.hwid,
+                            username = nil
+                        }
+                        
+                        local activateRes = httpPost(ENDPOINT .. "/api/keys/activate", activateBody)
+                        
+                        if activateRes then
+                            local actSuccess, actResult = pcall(function()
+                                return game:GetService("HttpService"):JSONDecode(activateRes)
+                            end)
+                            
+                            if actSuccess and actResult and actResult.success then
+                                submitBtn.Text = "Activated!"
+                                env.PROJECT_LICENSE_KEY = k
+                                env._TITANIUM_HWID = clientInfo.hwid
+                                done:Fire(k, true)
+                                gui.Enabled = false
+                                gui:ClearAllChildren()
+                            else
+                                submitBtn.Text = "Continue"
+                                submitBtn.Active = true
+                                statusLabel.Text = "Activation failed: " .. (actResult and actResult.error or "Unknown")
+                            end
+                        else
+                            submitBtn.Text = "Continue"
+                            submitBtn.Active = true
+                            statusLabel.Text = "Network error during activation"
+                        end
+                    end
+                else
+                    submitBtn.Text = "Continue"
+                    submitBtn.Active = true
+                    statusLabel.Text = result.error or "Invalid key"
+                    
+                    if result.locked then
+                        print("[TITANIUM] HWID/IP Lock Error:")
+                        print("[TITANIUM] Your HWID: " .. tostring(clientInfo.hwid))
+                        print("[TITANIUM] Error: " .. tostring(result.error))
+                    end
+                end
+            else
+                submitBtn.Text = "Continue"
+                submitBtn.Active = true
+                statusLabel.Text = "Validation error"
             end
-            gui:Destroy()
         else
-            status.Text = "Invalid key"
+            submitBtn.Text = "Continue"
+            submitBtn.Active = true
+            statusLabel.Text = "Network error - check connection"
         end
     end
 
-    btn.MouseButton1Click:Connect(submit)
-    box.FocusLost:Connect(function(enterPressed)
-        if enterPressed then
-            submit()
-        end
+    submitBtn.MouseButton1Click:Connect(submit)
+    keyBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then submit() end
     end)
 
-    UserInputService.InputBegan:Connect(function(input, gp)
-        if gp then return end
-        if input.KeyCode == Enum.KeyCode.Escape then
-            enforceOnTop()
-            pcall(function() box:CaptureFocus() end)
-        end
-    end)
-
-    box:CaptureFocus()
-
-    do
-        local startPos = frame.Position
-        frame.Position = startPos + UDim2.new(0, 0, 0, 10)
-        frame.BackgroundTransparency = 1
-        stroke.Transparency = 1
-        TweenService:Create(frame, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            Position = startPos,
-            BackgroundTransparency = 0
-        }):Play()
-        TweenService:Create(stroke, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            Transparency = 0
-        }):Play()
-    end
+    keyBox:CaptureFocus()
 
     return done.Event:Wait()
 end
 
-local key = getKey()
-if not key then
-    key = promptForKey()
-end
-
-local function fetchPayload(k)
+-- Fetch payload
+local function fetchPayload(key)
     local cb = tostring(os.time()) .. tostring(math.random(1000, 9999))
-    local url = ENDPOINT .. "?key=" .. urlEncode(k) .. "&cb=" .. cb
+    local url = LICENSING_ENDPOINT .. "/v1/payload?key=" .. urlEncode(key) .. "&cb=" .. cb
     local body, info = httpGet(url)
     return body, info, url
 end
 
-local payload, info
-local lastUrl
-for i = 1, 3 do
-    payload, info, lastUrl = fetchPayload(key)
-    if type(payload) == "string" and #payload >= 8 then
-        break
+-- Main flow
+local function main()
+    local env = (getgenv and getgenv()) or _G
+
+    -- Step 1: Get and validate key
+    print("[TITANIUM] Starting...")
+    
+    local key, isFirstActivation = validateKey()
+    
+    if not key then
+        error("Key entry cancelled")
     end
-    task.wait(0.15)
-end
-
-if type(payload) ~= "string" or #payload < 8 then
-    local msg = "Failed to download payload"
-    msg = msg .. " (info=" .. tostring(info) .. ")"
-    msg = msg .. " endpoint=" .. tostring(ENDPOINT)
-    msg = msg .. " url=" .. tostring(lastUrl)
-    if type(payload) == "string" then
-        msg = msg .. " body_len=" .. tostring(#payload)
-        msg = msg .. " body_prefix=" .. payload:sub(1, 80)
-    else
-        msg = msg .. " body_type=" .. tostring(typeof(payload))
+    
+    print("[TITANIUM] Key validated. First activation: " .. tostring(isFirstActivation))
+    
+    -- Step 2: Fetch payload
+    print("[TITANIUM] Loading payload...")
+    
+    local payload, info, lastUrl
+    for i = 1, 3 do
+        payload, info, lastUrl = fetchPayload(key)
+        if type(payload) == "string" and #payload >= 8 then
+            break
+        end
+        task.wait(0.15)
     end
-    error(msg)
+
+    if type(payload) ~= "string" or #payload < 8 then
+        error("Failed to download payload")
+    end
+
+    print("[TITANIUM] Payload loaded: " .. tostring(#payload) .. " bytes")
+    
+    local fn, err = loadstring(payload)
+    if not fn then
+        print("[TITANIUM DEBUG] Error: " .. tostring(err))
+        error("Payload compile error: " .. tostring(err))
+    end
+
+    return fn()
 end
 
-local fn, err = loadstring(payload)
-if not fn then
-    error("Payload compile error: " .. tostring(err))
+-- Run
+local success, result = pcall(main)
+
+if not success then
+    warn("[TITANIUM] Error: " .. tostring(result))
+    error(result)
 end
 
-return fn()
+return result
