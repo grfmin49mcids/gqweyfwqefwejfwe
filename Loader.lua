@@ -269,7 +269,7 @@ local function promptForKey()
     hint.TextSize = 12
     hint.TextColor3 = Color3.fromRGB(170, 175, 190)
     hint.TextXAlignment = Enum.TextXAlignment.Left
-    hint.Text = "Tip: press Enter to submit"
+    hint.Text = "Have fun"
     hint.ZIndex = 101
     hint.Parent = frame
 
