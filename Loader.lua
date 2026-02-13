@@ -1,5 +1,5 @@
 local ENDPOINT = "https://titanium-staff.test5555543.workers.dev"
-local LICENSING_ENDPOINT = "https://715bbbf9.titanium-pages-proxy.pages.dev"
+local LICENSING_ENDPOINT = "https://titanium-licensing.test5555543.workers.dev"
 
 -- Get HWID (Hardware ID) - uses Roblox's analytics service for stable ID
 local function getHWID()
@@ -440,12 +440,61 @@ local function validateKey()
     return done.Event:Wait()
 end
 
--- Fetch payload
+-- Fetch payload with validation
 local function fetchPayload(key)
     local cb = tostring(os.time()) .. tostring(math.random(1000, 9999))
     local url = LICENSING_ENDPOINT .. "/v1/payload?key=" .. urlEncode(key) .. "&cb=" .. cb
     local body, info = httpGet(url)
+    
+    -- Debug logging
+    if type(body) == "string" then
+        print("[TITANIUM DEBUG] Payload URL: " .. tostring(url))
+        print("[TITANIUM DEBUG] Payload first 100 chars: " .. body:sub(1, 100))
+        print("[TITANIUM DEBUG] Payload length: " .. tostring(#body))
+        print("[TITANIUM DEBUG] HTTP info: " .. tostring(info))
+        
+        -- Check if it's HTML
+        if body:match("^%s*<") then
+            print("[TITANIUM DEBUG] WARNING: Payload appears to be HTML, not Lua!")
+            print("[TITANIUM DEBUG] Full payload: " .. body:sub(1, 500))
+            return nil, "html_response", url
+        end
+        
+        -- Check if it looks like Lua
+        if not body:match("^[%s%a%d_]") and not body:match("^%-%-") then
+            print("[TITANIUM DEBUG] WARNING: Payload doesn't look like valid Lua code")
+            return nil, "invalid_lua", url
+        end
+    end
+    
     return body, info, url
+end
+
+-- Validate payload is valid Lua without executing
+local function validatePayload(payload)
+    if type(payload) ~= "string" then
+        return false, "payload is not a string"
+    end
+    
+    -- Trim whitespace
+    payload = payload:gsub("^%s+", ""):gsub("%s+$", "")
+    
+    if #payload < 8 then
+        return false, "payload too short (" .. tostring(#payload) .. " bytes)"
+    end
+    
+    -- Check for HTML/XML
+    if payload:sub(1, 1) == "<" then
+        return false, "payload is HTML/XML, not Lua"
+    end
+    
+    -- Try to compile
+    local fn, err = loadstring(payload)
+    if not fn then
+        return false, "compile error: " .. tostring(err)
+    end
+    
+    return true, fn
 end
 
 -- Main flow
@@ -463,30 +512,45 @@ local function main()
     
     print("[TITANIUM] Key validated. First activation: " .. tostring(isFirstActivation))
     
-    -- Step 2: Fetch payload
+    -- Step 2: Fetch payload with validation
     print("[TITANIUM] Loading payload...")
     
     local payload, info, lastUrl
     for i = 1, 3 do
         payload, info, lastUrl = fetchPayload(key)
-        if type(payload) == "string" and #payload >= 8 then
-            break
+        if type(payload) == "string" then
+            -- Validate it's actual Lua code
+            local isValid, result = validatePayload(payload)
+            if isValid then
+                print("[TITANIUM] Payload validated successfully")
+                break
+            else
+                print("[TITANIUM DEBUG] Attempt " .. tostring(i) .. " failed: " .. tostring(result))
+                payload = nil
+            end
+        else
+            print("[TITANIUM DEBUG] Attempt " .. tostring(i) .. " returned nil: " .. tostring(info))
         end
-        task.wait(0.15)
+        task.wait(0.5)
     end
 
-    if type(payload) ~= "string" or #payload < 8 then
-        error("Failed to download payload")
+    if type(payload) ~= "string" then
+        error("Failed to download valid Lua payload. Last URL: " .. tostring(lastUrl) .. " | Info: " .. tostring(info))
     end
 
     print("[TITANIUM] Payload loaded: " .. tostring(#payload) .. " bytes")
     
-    local fn, err = loadstring(payload)
-    if not fn then
-        print("[TITANIUM DEBUG] Error: " .. tostring(err))
-        error("Payload compile error: " .. tostring(err))
+    -- Final validation before execution
+    local isValid, fnOrErr = validatePayload(payload)
+    if not isValid then
+        print("[TITANIUM DEBUG] Final validation failed: " .. tostring(fnOrErr))
+        print("[TITANIUM DEBUG] Payload preview (first 200 chars): " .. payload:sub(1, 200))
+        error("Payload validation failed: " .. tostring(fnOrErr))
     end
-
+    
+    local fn = fnOrErr
+    print("[TITANIUM] Executing payload...")
+    
     return fn()
 end
 
