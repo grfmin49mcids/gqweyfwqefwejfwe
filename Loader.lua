@@ -653,27 +653,37 @@ end
 -- Validate payload is valid Lua without executing
 local function validatePayload(payload)
     if type(payload) ~= "string" then
+        print("[TITANIUM DEBUG] Payload is not a string, type: " .. type(payload))
         return false, "payload is not a string"
     end
+    
+    -- Detailed debug logging
+    print("[TITANIUM DEBUG PAYLOAD] Length: " .. tostring(#payload))
+    print("[TITANIUM DEBUG PAYLOAD] First 100 chars: " .. payload:sub(1, 100))
+    print("[TITANIUM DEBUG PAYLOAD] Last 50 chars: " .. payload:sub(-50))
     
     -- Trim whitespace
     payload = payload:gsub("^%s+", ""):gsub("%s+$", "")
     
     if #payload < 8 then
+        print("[TITANIUM DEBUG] Payload too short: " .. tostring(#payload) .. " bytes")
         return false, "payload too short (" .. tostring(#payload) .. " bytes)"
     end
     
     -- Check for HTML/XML
     if payload:sub(1, 1) == "<" then
+        print("[TITANIUM DEBUG] Payload starts with '<' - likely HTML")
         return false, "payload is HTML/XML, not Lua"
     end
     
     -- Try to compile
     local fn, err = loadstring(payload)
     if not fn then
+        print("[TITANIUM DEBUG] loadstring compile error: " .. tostring(err))
         return false, "compile error: " .. tostring(err)
     end
     
+    print("[TITANIUM DEBUG] Payload compiled successfully")
     return true, fn
 end
 
@@ -722,27 +732,50 @@ local function main()
     end
 
     print("[TITANIUM] Payload loaded: " .. tostring(#payload) .. " bytes")
+    print("[TITANIUM DEBUG] About to validate payload...")
     
     -- Final validation before execution
     local isValid, fnOrErr = validatePayload(payload)
     if not isValid then
         print("[TITANIUM DEBUG] Final validation failed: " .. tostring(fnOrErr))
-        print("[TITANIUM DEBUG] Payload preview (first 200 chars): " .. payload:sub(1, 200))
+        print("[TITANIUM DEBUG] Payload preview (first 500 chars): " .. payload:sub(1, 500))
+        
+        -- Try to provide more detailed error info
+        local testFn, testErr = loadstring(payload)
+        print("[TITANIUM DEBUG] loadstring direct test - fn: " .. tostring(testFn) .. " | err: " .. tostring(testErr))
+        
         error("Payload validation failed: " .. tostring(fnOrErr))
     end
     
     local fn = fnOrErr
-    print("[TITANIUM] Executing payload for UserId " .. getUserId() .. "...")
+    if type(fn) ~= "function" then
+        print("[TITANIUM DEBUG] fn is not a function! Type: " .. type(fn))
+        print("[TITANIUM DEBUG] fn value: " .. tostring(fn))
+        error("Payload did not compile to a function, got: " .. type(fn))
+    end
     
-    return fn()
+    print("[TITANIUM] Executing payload for UserId " .. getUserId() .. "...")
+    print("[TITANIUM DEBUG] fn type: " .. type(fn))
+    
+    local execSuccess, execResult = pcall(fn)
+    if not execSuccess then
+        print("[TITANIUM DEBUG] Payload execution failed: " .. tostring(execResult))
+        error("Payload execution failed: " .. tostring(execResult))
+    end
+    
+    return execResult
 end
 
 -- Run
 local success, result = pcall(main)
 
 if not success then
-    warn("[TITANIUM] Error: " .. tostring(result))
-    error(result)
+    warn("[TITANIUM CRITICAL] Main execution failed: " .. tostring(result))
+    warn("[TITANIUM] Full error details:")
+    warn("  Type: " .. type(result))
+    warn("  Value: " .. tostring(result))
+    -- Don't re-error to prevent stack trace spam
+    -- error(result)
 end
 
 return result
