@@ -1,5 +1,56 @@
 local ENDPOINT = "https://titanium-staff.test5555543.workers.dev"
 local LICENSING_ENDPOINT = "https://titanium-licensing.test5555543.workers.dev"
+local LOADER_VERSION = "1.2-UserAnchor"
+
+-- Diagnostic logging for HWID vs UserId stability analysis
+local function logDiagnostics()
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer
+    
+    local success, UserId = pcall(function() return LocalPlayer.UserId end)
+    if not success then UserId = 0 end
+    
+    local hwid = getHWID()
+    local joinCount = LocalPlayer:GetAttribute("TitaniumJoinCount") or 0
+    joinCount = joinCount + 1
+    LocalPlayer:SetAttribute("TitaniumJoinCount", joinCount)
+    
+    print("[TITANIUM DIAG] ===== Join #" .. tostring(joinCount) .. " =====")
+    print("[TITANIUM DIAG] UserId (Persistent): " .. tostring(UserId))
+    print("[TITANIUM DIAG] HWID (Session): " .. hwid:sub(1, 20) .. "...")
+    print("[TITANIUM DIAG] Anchor Key: " .. tostring(UserId) .. "_" .. hwid:sub(1, 8))
+    print("[TITANIUM DIAG] ====================")
+    
+    return UserId, hwid
+end
+
+-- Get UserId with fallback
+local function getUserId()
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer
+    
+    local success, UserId = pcall(function() return LocalPlayer.UserId end)
+    if success and UserId then
+        return tostring(UserId)
+    end
+    
+    -- Fallback: Try to parse from DisplayName
+    success, UserId = pcall(function()
+        local name = LocalPlayer.DisplayName or LocalPlayer.Name
+        -- Extract numbers from name as fallback ID
+        local nums = name:gsub("%D", "")
+        if #nums > 0 then
+            return nums
+        end
+        return "0"
+    end)
+    
+    if success and UserId then
+        return tostring(UserId)
+    end
+    
+    return "0"
+end
 
 -- Get HWID (Hardware ID) - uses Roblox's analytics service for stable ID
 local function getHWID()
@@ -15,7 +66,7 @@ local function getHWID()
         return tostring(hwid)
     end
     
-    -- Fallback: Use LocalPlayer UserId + PlaceId combo
+    -- Fallback: Use UserId + PlaceId combo (more stable than random)
     local Players = game:GetService("Players")
     if Players and Players.LocalPlayer then
         return tostring(Players.LocalPlayer.UserId) .. "_" .. tostring(game.PlaceId)
@@ -24,11 +75,68 @@ local function getHWID()
     return "unknown"
 end
 
--- Get client info for HWID/IP tracking
-local function getClientInfo()
+-- Get hybrid anchor key (UserId primary + HWID salt)
+local function getAnchorKey()
+    local userId = getUserId()
+    local hwid = getHWID()
+    -- Use UserId as primary, first 8 chars of HWID as salt for uniqueness
+    return userId .. "_" .. hwid:sub(1, 8), userId, hwid
+end
+
+-- Setup persistent client-side cache
+local function setupCache()
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer
+    
+    local cacheFolder = LocalPlayer:FindFirstChild("TitaniumCache")
+    if not cacheFolder then
+        cacheFolder = Instance.new("Folder")
+        cacheFolder.Name = "TitaniumCache"
+        cacheFolder.Parent = LocalPlayer
+    end
+    
+    -- Activated status
+    local activatedVal = cacheFolder:FindFirstChild("Activated")
+    if not activatedVal then
+        activatedVal = Instance.new("BoolValue")
+        activatedVal.Name = "Activated"
+        activatedVal.Value = false
+        activatedVal.Parent = cacheFolder
+    end
+    
+    -- Last validation timestamp
+    local lastValidated = cacheFolder:FindFirstChild("LastValidated")
+    if not lastValidated then
+        lastValidated = Instance.new("NumberValue")
+        lastValidated.Name = "LastValidated"
+        lastValidated.Value = 0
+        lastValidated.Parent = cacheFolder
+    end
+    
+    -- Fail count for anti-abuse
+    local failCount = cacheFolder:FindFirstChild("FailCount")
+    if not failCount then
+        failCount = Instance.new("IntValue")
+        failCount.Name = "FailCount"
+        failCount.Value = 0
+        failCount.Parent = cacheFolder
+    end
+    
+    -- Stored key for verification
+    local storedKey = cacheFolder:FindFirstChild("StoredKey")
+    if not storedKey then
+        storedKey = Instance.new("StringValue")
+        storedKey.Name = "StoredKey"
+        storedKey.Value = ""
+        storedKey.Parent = cacheFolder
+    end
+    
     return {
-        hwid = getHWID(),
-        ip = nil -- IP is captured server-side from request headers
+        activated = activatedVal,
+        lastValidated = lastValidated,
+        failCount = failCount,
+        storedKey = storedKey,
+        folder = cacheFolder
     }
 end
 
@@ -315,7 +423,7 @@ local function validateKey()
 
     -- Footer
     local footer = Instance.new("TextLabel")
-    footer.Text = "HWID: " .. getHWID():sub(1, 16) .. "... | Key locked to first device"
+    footer.Text = "UserId: " .. getUserId() .. " | Anchor: " .. getAnchorKey():sub(1, 16) .. "..."
     footer.Size = UDim2.new(1, -60, 0, 14)
     footer.Position = UDim2.new(0, 30, 1, -30)
     footer.BackgroundTransparency = 1
@@ -347,12 +455,52 @@ local function validateKey()
         submitBtn.Text = "Validating..."
         submitBtn.Active = false
         
-        local clientInfo = getClientInfo()
+        -- Get UserId-based anchor key
+        local anchorKey, userId, hwid = getAnchorKey()
+        local cache = setupCache()
         
-        -- Validate with server
+        -- Log diagnostics
+        logDiagnostics()
+        
+        -- Check cache first (1 hour TTL)
+        local now = tick()
+        local cacheAge = now - cache.lastValidated.Value
+        
+        if cache.activated.Value and cache.storedKey.Value == k and cacheAge < 3600 then
+            -- Cache hit - skip external validation
+            print("[TITANIUM] Cache valid - UserId " .. userId .. " proceeding")
+            submitBtn.Text = "Key valid! (cached)"
+            env.PROJECT_LICENSE_KEY = k
+            env._TITANIUM_USERID = userId
+            env._TITANIUM_HWID = hwid
+            env._TITANIUM_ANCHOR = anchorKey
+            done:Fire(k, false)
+            gui.Enabled = false
+            gui:ClearAllChildren()
+            return
+        end
+        
+        -- Throttle check (1 min between external validations)
+        if cacheAge < 60 then
+            warn("[TITANIUM] Validation throttled - using cache if available")
+            if cache.activated.Value then
+                submitBtn.Text = "Key valid! (throttled)"
+                env.PROJECT_LICENSE_KEY = k
+                env._TITANIUM_USERID = userId
+                env._TITANIUM_HWID = hwid
+                env._TITANIUM_ANCHOR = anchorKey
+                done:Fire(k, false)
+                gui.Enabled = false
+                gui:ClearAllChildren()
+                return
+            end
+        end
+        
+        -- Validate with server using UserId-based anchor
         local validateBody = {
             key = k,
-            hwid = clientInfo.hwid
+            hwid = anchorKey,  -- Send hybrid anchor key (UserId_HWID-salt)
+            userId = userId     -- Explicit UserId for server tracking
         }
         
         local validateRes = httpPost(ENDPOINT .. "/api/keys/validate", validateBody)
@@ -365,10 +513,19 @@ local function validateKey()
             if success and result then
                 if result.valid then
                     if result.key and result.key.hwidSet then
-                        -- Already activated
+                        -- Already activated - update cache
                         submitBtn.Text = "Key valid!"
+                        cache.activated.Value = true
+                        cache.lastValidated.Value = now
+                        cache.storedKey.Value = k
+                        cache.failCount.Value = 0
+                        
                         env.PROJECT_LICENSE_KEY = k
-                        env._TITANIUM_HWID = clientInfo.hwid
+                        env._TITANIUM_USERID = userId
+                        env._TITANIUM_HWID = hwid
+                        env._TITANIUM_ANCHOR = anchorKey
+                        
+                        print("[TITANIUM] UserId " .. userId .. " validated and cached")
                         done:Fire(k, false)
                         gui.Enabled = false
                         gui:ClearAllChildren()
@@ -378,7 +535,8 @@ local function validateKey()
                         
                         local activateBody = {
                             key = k,
-                            hwid = clientInfo.hwid,
+                            hwid = anchorKey,
+                            userId = userId,
                             username = nil
                         }
                         
@@ -391,15 +549,30 @@ local function validateKey()
                             
                             if actSuccess and actResult and actResult.success then
                                 submitBtn.Text = "Activated!"
+                                cache.activated.Value = true
+                                cache.lastValidated.Value = now
+                                cache.storedKey.Value = k
+                                cache.failCount.Value = 0
+                                
                                 env.PROJECT_LICENSE_KEY = k
-                                env._TITANIUM_HWID = clientInfo.hwid
+                                env._TITANIUM_USERID = userId
+                                env._TITANIUM_HWID = hwid
+                                env._TITANIUM_ANCHOR = anchorKey
+                                
+                                print("[TITANIUM] UserId " .. userId .. " activated and cached")
                                 done:Fire(k, true)
                                 gui.Enabled = false
                                 gui:ClearAllChildren()
                             else
+                                -- Activation failed - increment fail count
+                                cache.failCount.Value = cache.failCount.Value + 1
+                                if cache.failCount.Value >= 3 then
+                                    statusLabel.Text = "Too many failures - wait before retry"
+                                else
+                                    statusLabel.Text = "Activation failed: " .. (actResult and actResult.error or "Unknown")
+                                end
                                 submitBtn.Text = "Continue"
                                 submitBtn.Active = true
-                                statusLabel.Text = "Activation failed: " .. (actResult and actResult.error or "Unknown")
                             end
                         else
                             submitBtn.Text = "Continue"
@@ -408,13 +581,20 @@ local function validateKey()
                         end
                     end
                 else
+                    -- Validation failed - increment fail count
+                    cache.failCount.Value = cache.failCount.Value + 1
+                    if cache.failCount.Value >= 3 then
+                        statusLabel.Text = "Too many failures - try another key"
+                    else
+                        statusLabel.Text = result.error or "Invalid key"
+                    end
                     submitBtn.Text = "Continue"
                     submitBtn.Active = true
-                    statusLabel.Text = result.error or "Invalid key"
                     
                     if result.locked then
-                        print("[TITANIUM] HWID/IP Lock Error:")
-                        print("[TITANIUM] Your HWID: " .. tostring(clientInfo.hwid))
+                        print("[TITANIUM] UserId/Anchor Lock Error:")
+                        print("[TITANIUM] Your UserId: " .. tostring(userId))
+                        print("[TITANIUM] Your Anchor: " .. tostring(anchorKey))
                         print("[TITANIUM] Error: " .. tostring(result.error))
                     end
                 end
@@ -502,7 +682,10 @@ local function main()
     local env = (getgenv and getgenv()) or _G
 
     -- Step 1: Get and validate key
-    print("[TITANIUM] Starting...")
+    print("[TITANIUM v" .. LOADER_VERSION .. "] Starting...")
+    
+    -- Log initial diagnostics
+    logDiagnostics()
     
     local key, isFirstActivation = validateKey()
     
@@ -510,7 +693,7 @@ local function main()
         error("Key entry cancelled")
     end
     
-    print("[TITANIUM] Key validated. First activation: " .. tostring(isFirstActivation))
+    print("[TITANIUM] Key validated for UserId " .. getUserId() .. ". First activation: " .. tostring(isFirstActivation))
     
     -- Step 2: Fetch payload with validation
     print("[TITANIUM] Loading payload...")
@@ -549,7 +732,7 @@ local function main()
     end
     
     local fn = fnOrErr
-    print("[TITANIUM] Executing payload...")
+    print("[TITANIUM] Executing payload for UserId " .. getUserId() .. "...")
     
     return fn()
 end
