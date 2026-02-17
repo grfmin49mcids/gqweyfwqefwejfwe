@@ -1,4 +1,4 @@
-local _L="DIAG-2026-02-15A"
+local _L="v1 dev"
 local _E="https://titanium-licensing.test5555543.workers.dev"
 local P=game:GetService("Players")
 local LP=P.LocalPlayer
